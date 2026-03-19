@@ -1,0 +1,1 @@
+{"root":["./src/main.ts","./src/composables/usechat.ts","./src/composables/usehistory.ts","./src/types/index.ts","./src/app.vue","./src/components/historypanel.vue","./src/components/inputarea.vue","./src/components/messagebubble.vue","./src/components/toolbar.vue","./src/components/typingindicator.vue","./src/views/chatview.vue"],"version":"5.7.3"}
