@@ -171,6 +171,62 @@ async with SynapseClient("http://localhost:8000") as client:
 - `EMBEDDING_DIM` — Embedding 维度（默认 1024）
 - `MAX_MEMORY_TOKENS` — 记忆检索的 token 预算
 
+## Roadmap
+
+> 当前版本已实现核心检索闭环，以下为后续优化方向。
+
+### 🚀 话题 / 事件处理速度
+
+| 优化项 | 现状 | 目标 |
+|--------|------|------|
+| **异步归档并行化** | 归档时串行执行摘要生成 → Chunk 索引 → 图谱更新 | 将摘要生成、Embedding 入库、三元组抽取改为 `asyncio.gather` 全并行执行 |
+| **Embedding 批量化** | 归档时逐条 Chunk 向量化 | 合并为单次批量 [embed_texts](file:///c:/Users/chenchen/.openclaw/workspace/synapse_memory/services/embedding_service.py#57-88) 调用，减少 HTTP 往返 |
+| **三元组抽取批处理** | 每个 Chunk 独立调用一次 LLM | 合并相邻 Chunk 上下文后批量提交，减少 LLM 调用次数，加入实体注释提高实体合并精度 |
+| **Session 持久化** | 内存 Dict + threading.Lock，重启丢失 | 引入 Redis 作为 Session 缓存层，支持多实例水平扩展 |
+
+### 🎯 Agent 召回精度
+
+| 优化项 | 现状 | 目标 |
+|--------|------|------|
+| **查询重写质量** | 单轮 LLM 重写，生成 ≤3 条子查询 | 引入 Chain-of-Thought 提示策略，支持意图识别 + 多粒度查询生成 |
+| **图谱辅助召回** | 实体提取为占位逻辑，图谱上下文利用率低 | 强化 NER 抽取流程，通过图谱关系做关联扩展召回（A→B→C 二跳追踪） |
+| **Rerank 模型升级** | 使用轻量 Cross-Encoder (0.6B) | 支持可配置的 Rerank 模型切换，评估更高精度模型对端到端效果的提升 |
+| **动态相似度阈值** | 固定 `min_similarity=0.5` | 根据查询类型和候选集分布动态调整阈值，减少噪声 Chunk |
+| **逆向召回上下文窗口** | 按 `section_index` 固定窗口 ±N | 支持跨章节的段落级精细定位（`section_index + paragraph_index` 联合定位） |
+| **去重策略** | 基于 `chunk_id` 精确去重 | 引入语义去重（MinHash / SimHash），过滤内容高度重叠的 Chunk |
+
+### ⏱️ Agent 召回延迟
+
+| 优化项 | 现状 | 目标 |
+|--------|------|------|
+| **检索与 Rerank 流水线化** | 检索 → 等待全部完成 → Rerank（串行） | 流式处理，边出结果边送入 Rerank，减少等待时间 |
+| **Embedding 缓存** | 每次查询都重新生成 query embedding | 引入 LRU 缓存层，相同/相似 query 直接命中 |
+| **多查询并行检索** | 重写后的子查询串行处理 | `asyncio.gather` 并行检索所有子查询的 Chunk + Summary |
+| **Milvus 连接池** | 每次请求独立创建连接 | 引入连接池，减少连接建立开销 |
+| **Agent 迭代的早停机制** | 固定最多 5 轮 | 基于增量信息增益判断——若新一轮补充召回没有显著新增内容，提前终止 |
+| **超时与降级** | 无全局超时控制 | 为 Agent 增强层设置超时阈值，超时自动降级为基础检索结果返回 |
+
+### 📦 数据摄入优化
+
+| 优化项 | 现状 | 目标 |
+|--------|------|------|
+| **增量摄入** | 每次全量重新处理 | 支持 `doc_id` 级别的增量更新，仅重新处理变更部分 |
+| **大文档流式切分** | 全文加载到内存 | 支持流式读取，降低大文档的内存峰值 |
+| **摘要向量批量入库** | 逐条摘要调 Embedding + Milvus | 合并为批量操作 |
+
+### 🔧 工程化 & 可观测性
+
+| 优化项 | 说明 |
+|--------|------|
+| **结构化日志** | 统一 JSON 日志格式，增加 `request_id` 贯穿全链路追踪 |
+| **性能指标采集** | 接入 Prometheus，暴露检索延迟、Rerank 耗时、归档队列深度等 Metrics |
+| **健康检查增强** | 当前 `/` 返回固定 OK，改为真实检测各依赖服务（PG / Milvus / Neo4j）连通性 |
+| **配置热更新** | 当前配置启动时加载一次，后续支持 `RetrievalConfig` 的运行时动态调整 |
+| **API 鉴权** | 增加 API Key / JWT 鉴权中间件，支持多租户隔离 |
+| **限流与熔断** | 对 LLM / Embedding 等外部依赖增加限流保护和熔断降级 |
+| **Docker 部署** | 提供 `Dockerfile` + `docker-compose.yml`，一键拉起全栈依赖 |
+| **K8s 生产部署** | 提供 Helm Chart / K8s Manifests，支持 HPA 自动扩缩容、配置与密钥管理（ConfigMap/Secret），实现滚动更新与高可用部署（待实践学习） |
+
 ## License
 
 [MIT](LICENSE)
