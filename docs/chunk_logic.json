@@ -1,0 +1,108 @@
+{
+    "schema_description": "定义了将长文档切分后的每个文本块 (Chunk) 的数据结构。该结构为扁平化设计，旨在服务于检索增强生成 (RAG) 等下游任务，并通过丰富的层级元数据优化了在向量数据库 (Milvus) 中的存储、索引和过滤能力。",
+    "chunk_structure": {
+        "chunk_id": {
+            "description": "一个在整个数据集中全局唯一的文本块标识符。该ID由其来源文档ID和在文档中的层级位置构成，方便追溯和调试。",
+            "data_type": "String",
+            "format": "{doc_id}_s{sec_idx}_p{para_idx}_c{sub_idx}",
+            "constraints": "全局唯一，不可为空。",
+            "vector_db_notes": "作为数据行的主键 (Primary Key)，自动被索引以支持通过ID直接获取。",
+            "example": "demo_paper_001_s8_p0_c0"
+        },
+        "doc_id": {
+            "description": "文本块所属的原始文档的唯一标识符。",
+            "data_type": "String",
+            "constraints": "不可为空。",
+            "vector_db_notes": "在 Milvus Schema 中创建标量索引 (Scalar Index) 以支持高性能过滤查询。",
+            "example": "demo_paper_001"
+        },
+        "doc_title": {
+            "description": "原始文档的标题，提供人类可读的上下文。",
+            "data_type": "String",
+            "constraints": "不可为空。",
+            "vector_db_notes": "可为其创建标量索引，以支持按标题进行过滤或搜索。",
+            "example": "Multi-Game Decision Transformers"
+        },
+        "section_hierarchy": {
+            "description": "一个描述文本块所在位置的完整章节层级路径的数组。这是实现结构感知检索的关键。",
+            "data_type": "Array of Strings",
+            "derivation_logic": "在阶段一“结构化预处理”中，通过维护章节栈动态生成。",
+            "vector_db_notes": "可以作为 JSON 字段存储，支持更复杂的基于路径的元数据过滤。",
+            "example": [
+                "Multi-Game Decision Transformers",
+                "3 Method",
+                "Expert Action Inference"
+            ]
+        },
+        "section_name": {
+            "description": "文本块所属的最具体的章节名称。",
+            "data_type": "String",
+            "derivation_logic": "直接取 'section_hierarchy' 数组中的最后一个元素。",
+            "example": "Expert Action Inference"
+        },
+        "section_index": {
+            "description": "文本块所属的'章节内容块'在文档中的顺序索引（从1开始）。",
+            "data_type": "Integer",
+            "derivation_logic": "在处理一篇文档时，为每个从阶段一生成的'非空章节内容块'分配的一个递增计数器。Abstract 默认为 1。",
+            "constraints": "大于或等于 1，连续无空洞。",
+            "example": 8
+        },
+        "paragraph_index": {
+            "description": "与此文本块关联的【主要】原始段落在其所属'章节内容块'内部的零基索引。",
+            "data_type": "Integer",
+            "derivation_note": "仅针对预清洗后的非空段落列表进行计数。对于合并块，此值为第一个段落的索引。对于拆分块，所有子块共享同一个父段落的索引。",
+            "constraints": "非负整数，连续无空洞。",
+            "example": 0
+        },
+        "sub_chunk_index": {
+            "description": "当一个原始段落被拆分成多个文本块时，该块在其中的零基子索引。",
+            "data_type": "Integer",
+            "derivation_note": "如果一个段落未被切分或合并，则该值为0。",
+            "constraints": "非负整数。",
+            "example": 0
+        },
+        "text_content": {
+            "description": "切分后的实际文本内容，这是将被向量化（embedding）的核心数据。",
+            "data_type": "String",
+            "constraints": [
+                "一般情况下字符长度不大于 1024。",
+                "在触发'小段落溢出合并'规则时，允许生成的块长度略微超过 1024。",
+                "文本块开头和结尾的空白字符应被移除。",
+                "重叠128个字符"
+            ],
+            "derivation_logic": {
+                "summary": "遵循两阶段策略。第一阶段按结构切分；第二阶段按长度微观合并/切分，优先保证小段落上下文完整性，允许适度溢出。",
+                "processing_flow": {
+                    "stage_1_structural_preprocessing": {
+                        "name": "阶段一：结构化预处理",
+                        "action": "解析文档结构，生成带有层级信息的章节块，并移除所有空段落以保证索引稠密性。"
+                    },
+                    "stage_2_content_aware_chunking": {
+                        "name": "阶段二：智能分块策略",
+                        "action": "对每个章节内容块，应用基于缓冲区的策略：",
+                        "sub_rules": {
+                            "rule_long_paragraph": {
+                                "condition": "段落长度 > 1024 字符，< 1536字符。",
+                                "action": "1. 强制清空缓冲区（提交旧块）。\n2. 如果超出1536字符，对该段落进行'硬切分'（按1024字符机械截断），生成多个子块。"
+                            },
+                            "rule_medium_paragraph": {
+                                "condition": "512 <= 段落长度 <= 1024 字符。",
+                                "action": "1. 强制清空缓冲区（提交旧块）。\n2. 该段落拒绝合并，直接作为一个独立的块提交。"
+                            },
+                            "rule_small_paragraph": {
+                                "condition": "段落长度 < 512 字符。",
+                                "action": "检查（当前缓冲区长度 + 该段落长度）是否 > 1536。\n否：合并提交并清空缓冲区。\n是：立即提交当前缓冲区，该段落复用规则段落长度 > 1024 字符，< 1536字符和512 <= 段落长度 <= 1024 字符。。"
+                            },
+                            "finalization": {
+                                "condition": "章节处理完毕。",
+                                "action": "若缓冲区仍有残留内容，将其作为一个块提交（可能产生较短的碎片）。"
+                            }
+                        }
+                    }
+                }
+            },
+            "vector_db_notes": "用于生成向量和检索展示。",
+            "example": "We propose an inference-time method..."
+        }
+    }
+}

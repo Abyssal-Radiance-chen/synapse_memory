@@ -1,12 +1,11 @@
 """
 Embedding 服务封装（全异步）
-使用本地 vLLM 部署的 Qwen3-Embedding 模型
+支持自定义 Embedding API（Qwen3-Embedding 等）
 """
 import logging
 from typing import List
 
 import httpx
-from openai import AsyncOpenAI
 
 import config
 
@@ -17,19 +16,13 @@ class EmbeddingService:
     """异步 Embedding 向量化服务"""
 
     def __init__(self):
-        cfg = config.EMBEDDING_MODEL
+        self.base_url = config.EMBEDDING_BASE_URL
+        self.api_key = config.EMBEDDING_API_KEY
+        self.model_name = config.EMBEDDING_NAME
+        self.dim = config.EMBEDDING_DIM
 
-        if not cfg.verify_ssl:
-            http_client = httpx.AsyncClient(verify=False)
-        else:
-            http_client = httpx.AsyncClient()
-
-        self.client = AsyncOpenAI(
-            base_url=cfg.base_url,
-            api_key=cfg.api_key,
-            http_client=http_client,
-        )
-        self.model_name = cfg.model
+        # HTTP 客户端
+        self.client = httpx.AsyncClient(verify=config.LLM_VERIFY_SSL, timeout=60.0)
 
     async def embed_text(self, text: str) -> List[float]:
         """对单段文本生成 embedding 向量（异步）"""
@@ -38,11 +31,25 @@ class EmbeddingService:
             return []
 
         try:
-            response = await self.client.embeddings.create(
-                model=self.model_name,
-                input=cleaned,
+            response = await self.client.post(
+                self.base_url,
+                json={
+                    "model": self.model_name,
+                    "input": cleaned,
+                },
+                headers={
+                    "X-Gateway-Key": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
             )
-            return response.data[0].embedding
+
+            if response.status_code != 200:
+                logger.error(f"Embedding 生成失败: {response.status_code} - {response.text}")
+                return []
+
+            data = response.json()
+            return data["data"][0]["embedding"]
+
         except Exception as e:
             logger.error(f"Embedding 生成失败: {e}")
             return []
@@ -56,11 +63,29 @@ class EmbeddingService:
         cleaned = [t if t else " " for t in cleaned]
 
         try:
-            response = await self.client.embeddings.create(
-                model=self.model_name,
-                input=cleaned,
+            response = await self.client.post(
+                self.base_url,
+                json={
+                    "model": self.model_name,
+                    "input": cleaned,
+                },
+                headers={
+                    "X-Gateway-Key": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
             )
-            return [d.embedding for d in response.data]
+
+            if response.status_code != 200:
+                logger.error(f"批量 Embedding 生成失败: {response.status_code} - {response.text}")
+                return [[] for _ in texts]
+
+            data = response.json()
+            return [d["embedding"] for d in data["data"]]
+
         except Exception as e:
             logger.error(f"批量 Embedding 生成失败: {e}")
             return [[] for _ in texts]
+
+    async def close(self):
+        """关闭客户端"""
+        await self.client.aclose()
