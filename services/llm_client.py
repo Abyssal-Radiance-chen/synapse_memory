@@ -35,14 +35,18 @@ class LLMClient:
         self.config = model_config
 
         if not model_config.verify_ssl:
-            http_client = httpx.AsyncClient(verify=False)
+            http_client = httpx.AsyncClient(verify=False, timeout=60.0)
         else:
-            http_client = httpx.AsyncClient()
+            http_client = httpx.AsyncClient(timeout=60.0)
+
 
         self.client = AsyncOpenAI(
             base_url=model_config.base_url,
             api_key=model_config.api_key,
             http_client=http_client,
+            default_headers={
+                "X-Gateway-Key": f"Bearer {model_config.api_key}",
+            },
         )
 
     async def chat(

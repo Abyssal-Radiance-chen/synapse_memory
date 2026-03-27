@@ -1,0 +1,503 @@
+Milvus：
+Public Endpoint: https://in03-51692353e235ae3.serverless.aws-eu-central-1.cloud.zilliz.com
+Token: 68145a95735b15b82f6022415895710534c17ccaa121d2c51dcf043c9d0023d7a841eefbdc60cb6034f9918137114fa5005e8539
+code example：
+import os
+import shutil
+import multiprocessing
+import time
+from pymilvus import MilvusClient, DataType
+from worker_logic import run_worker  # 导入刚才写入的文件
+from tqdm.auto import tqdm
+
+# --- 核心配置 ---
+# Milvus 配置
+MILVUS_URI = 'https://in03-51692353e235ae3.serverless.aws-eu-central-1.cloud.zilliz.com'
+MILVUS_TOKEN = '68145a95735b15b82f6022415895710534c17ccaa121d2c51dcf043c9d0023d7a841eefbdc60cb6034f9918137114fa5005e8539'
+MILVUS_COLLECTION_NAME = 'HotpotQA_Chunks'
+
+# 文件与模型配置
+SOURCE_FILE_DIR = '/kaggle/working/HotpotQA_simple'
+SHARD_DIR = '/kaggle/working/HotpotQA_shards'
+MODEL_NAME = 'Qwen3-Embedding-0.6B' # 确保这与 vLLM 启动参数一致
+DIM = 1024  # ⚠️ 确保维度正确，Qwen-0.6B 可能是 1024 或其他，请按实际模型输出填写
+
+# vLLM 地址列表 (你有几个 GPU/Server 就填几个)
+ENDPOINTS = [
+    "http://localhost:8080", 
+    "http://localhost:8081" # 如果有第二个 vLLM 实例，取消注释
+]
+
+def setup_milvus():
+    """初始化 Milvus Collection"""
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+    
+    # 如果存在则删除 (方便重跑，生产环境请谨慎)
+    if client.has_collection(MILVUS_COLLECTION_NAME):
+        print(f"🗑️ Dropping existing collection: {MILVUS_COLLECTION_NAME}")
+        client.drop_collection(MILVUS_COLLECTION_NAME)
+    
+    print(f"🔨 Creating collection: {MILVUS_COLLECTION_NAME}")
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+    
+    # 定义 Schema
+    schema.add_field("chunk_id", DataType.VARCHAR, is_primary=True, max_length=256)
+    schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=DIM)
+    schema.add_field("doc_title", DataType.VARCHAR, max_length=2048)
+    schema.add_field("text_content", DataType.VARCHAR, max_length=20000)
+    
+    index_params = client.prepare_index_params()
+    index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="L2")
+    
+    client.create_collection(
+        collection_name=MILVUS_COLLECTION_NAME, 
+        schema=schema, 
+        index_params=index_params
+    )
+    client.close()
+    print("✅ Collection created successfully.")
+
+def shard_files():
+    """将大文件均匀拆分给每个 Worker"""
+    if os.path.exists(SHARD_DIR): shutil.rmtree(SHARD_DIR)
+    os.makedirs(SHARD_DIR)
+    
+    src_file = [f for f in os.listdir(SOURCE_FILE_DIR) if f.endswith('.jsonl')][0]
+    src_path = os.path.join(SOURCE_FILE_DIR, src_file)
+    
+    # 打开 N 个文件句柄
+    handlers = [open(os.path.join(SHARD_DIR, f"shard_{i}.jsonl"), 'w', encoding='utf-8') for i in range(len(ENDPOINTS))]
+    paths = [os.path.join(SHARD_DIR, f"shard_{i}.jsonl") for i in range(len(ENDPOINTS))]
+    
+    print(f"🔪 Sharding file: {src_file} into {len(ENDPOINTS)} parts...")
+    count = 0
+    with open(src_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            handlers[count % len(ENDPOINTS)].write(line)
+            count += 1
+    
+    for h in handlers: h.close()
+    return paths
+
+if __name__ == "__main__":
+    # 必须设置 spawn 模式以兼容多进程和 CUDA (虽然这里 Worker 没直接用 CUDA，但这是好习惯)
+    multiprocessing.set_start_method("spawn", force=True)
+    
+    # 1. 设置 Milvus
+    setup_milvus()
+    
+    # 2. 切分文件
+    shard_paths = shard_files()
+    
+    # 3. 启动并行进程
+    processes = []
+    print(f"🚀 Starting {len(ENDPOINTS)} worker processes...")
+    start_time = time.time()
+    
+    for i in range(len(ENDPOINTS)):
+        p = multiprocessing.Process(
+            target=run_worker, 
+            args=(i, shard_paths[i], ENDPOINTS[i], MILVUS_URI, MILVUS_TOKEN, MILVUS_COLLECTION_NAME, MODEL_NAME)
+        )
+        p.start()
+        processes.append(p)
+        
+    for p in processes:
+        p.join()
+        
+    duration = time.time() - start_time
+    print(f"\n🎉 All Done! Total time: {duration:.2f}s")
+
+import os
+import json
+import shutil
+from datasets import load_dataset
+from tqdm.auto import tqdm
+
+# --- 配置 ---
+OUTPUT_DIR = '/kaggle/working/HotpotQA_QA_Pair'
+QUESTION_FILE = os.path.join(OUTPUT_DIR, 'hotpotqa_questions.txt')
+ANSWER_FILE = os.path.join(OUTPUT_DIR, 'hotpotqa_answers.txt')
+
+if os.path.exists(OUTPUT_DIR): shutil.rmtree(OUTPUT_DIR)
+os.makedirs(OUTPUT_DIR)
+
+def generate_qa_files():
+    # 1. 加载数据
+    print("正在加载数据集 (hotpot_qa / distractor / validation)...")
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
+    
+    print(f"正在写入文件到 {OUTPUT_DIR} ...")
+    
+    with open(QUESTION_FILE, 'w', encoding='utf-8') as f_q, \
+         open(ANSWER_FILE, 'w', encoding='utf-8') as f_a:
+        
+        for example in tqdm(ds):
+            # --- 1. 处理 Question (纯文本) ---
+            # 去除换行符，写入一行
+            q_text = example['question'].replace('\n', ' ').strip()
+            f_q.write(q_text + "\n")
+            
+            # --- 2. 处理 Answer (JSON 结构) ---
+            
+            # A. 构建 {Title: Content} 查找字典
+            context_map = {}
+            for title, sentences in zip(example['context']['title'], example['context']['sentences']):
+                # 将句子列表拼接，并清洗换行符
+                full_text = "".join(sentences).replace('\n', ' ').strip()
+                context_map[title] = full_text
+            
+            # B. 获取并排序 supporting_facts (Evidence)
+            fact_titles = example['supporting_facts']['title']
+            seen_titles = set()
+            evidence_list = []
+            
+            for t in fact_titles:
+                # 去重同时保持顺序
+                if t not in seen_titles:
+                    # 确保 title 在 context 中存在 (极少数情况可能缺失)
+                    if t in context_map:
+                        evidence_list.append({
+                            "title": t,
+                            "content": context_map[t]
+                        })
+                    seen_titles.add(t)
+            
+            # C. 构建 JSON 对象
+            # 包含简短答案和结构化的证据列表
+            answer_obj = {
+                "answer": example['answer'].strip(),
+                "evidence": evidence_list
+            }
+            
+            # D. 将 JSON 对象转为字符串写入一行
+            f_a.write(json.dumps(answer_obj, ensure_ascii=False) + "\n")
+
+    print("\n✅ 处理完成！")
+    print(f"📂 问题文件: {QUESTION_FILE}")
+    print(f"📂 答案文件: {ANSWER_FILE}")
+
+    # --- 预览 ---
+    print("\n🔍 预览 hotpot_qa_questions.txt (第一行):")
+    with open(QUESTION_FILE, 'r', encoding='utf-8') as f:
+        print(f.readline().strip())
+        
+    print("\n🔍 预览 hotpot_qa_answers.txt (第一行 - 格式化显示):")
+    with open(ANSWER_FILE, 'r', encoding='utf-8') as f:
+        # 读取一行（即一个 JSON 字符串）
+        line = f.readline().strip()
+        # 解析为 JSON 对象以便打印查看
+        obj = json.loads(line)
+        print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+if __name__ == "__main__":
+    generate_qa_files()
+
+
+neo4j:
+Username: e51a0f19
+Password: N9TNke3dyAVk1HWdlZhITzifqoPoc4q020oib9u1Rcc
+
+code example：
+1. Install
+Install the Neo4j Python driver with pip:
+pip install neo4j
+
+More info on installing the driver
+2. Connect to the database
+Connect to a database by creating a Driver object and providing a URL and an authentication token. Once you have a Driver instance, use the .verify_connectivity() method to ensure that a working connection can be established.
+from neo4j import GraphDatabase
+
+# URI examples: "neo4j://localhost", "neo4j+ssc://<username>.databases.neo4j.io"
+URI = "<database-uri>"
+AUTH = ("<username>", "<password>")
+
+with GraphDatabase.driver(URI, auth=AUTH) as driver:
+    driver.verify_connectivity()
+
+More info on connecting to a database
+3. Create an example graph
+Run a Cypher query with the method Driver.execute_query(). Do not hardcode or concatenate parameters: use placeholders and specify the parameters as keyword arguments.
+Create two Person nodes and a KNOWS relationship between them
+summary = driver.execute_query("""
+    CREATE (a:Person {name: $name})
+    CREATE (b:Person {name: $friendName})
+    CREATE (a)-[:KNOWS]->(b)
+    """,
+    name="Alice", friendName="David",
+    database_="<database-name>",
+).summary
+print("Created {nodes_created} nodes in {time} ms.".format(
+    nodes_created=summary.counters.nodes_created,
+    time=summary.result_available_after
+))
+
+More info on querying the database
+4. Query a graph
+To retrieve information from the database, use the Cypher clause MATCH:
+Retrieve all Person nodes who know other persons
+records, summary, keys = driver.execute_query("""
+    MATCH (p:Person)-[:KNOWS]->(:Person)
+    RETURN p.name AS name
+    """,
+    database_="<database-name>",
+)
+
+# Loop through results and do something with them
+for record in records:
+    print(record.data())  # obtain record as dict
+
+# Summary information
+print("The query `{query}` returned {records_count} records in {time} ms.".format(
+    query=summary.query, records_count=len(records),
+    time=summary.result_available_after
+))
+
+
+More info on querying the database
+5. Close connections and sessions
+Unless you created them using the with statement, call the .close() method on all Driver and Session instances to release any resources still held by them.
+from neo4j import GraphDatabase
+
+
+driver = GraphDatabase.driver(URI, auth=AUTH)
+session = driver.session(database="<database-name>")
+
+# session/driver usage
+
+session.close()
+driver.close()
+
+pgsql:
+Database password: JU0w8bR6UFhuTAoQ
+Connect your app
+Supabase Grafana
+Skip the steps
+Prompt your agent
+
+Copy a prompt with everything your agent needs to connect your app for you.
+
+
+Copy prompt
+1
+Install dependencies
+
+Run this command to install the required dependencies.
+
+pip install python-dotenv psycopg2
+
+2
+Add files
+
+Add the following files to your project.
+
+main.py
+.env
+1import psycopg2
+2from dotenv import load_dotenv
+3import os
+4
+5# Load environment variables from .env
+6load_dotenv()
+7
+8# Fetch variables
+9DATABASE_URL = os.getenv("DATABASE_URL")
+10
+11# Connect to the database
+12connection = psycopg2.connect(DATABASE_URL)
+
+host:
+db.gdyzsbcqfonzwpiubrnp.supabase.co
+
+port:
+5432
+
+database:
+postgres
+
+user:
+postgres
+
+3
+Install Agent Skills (Optional)
+
+Agent Skills give AI coding tools ready-made instructions, scripts, and resources for working with Supabase more accurately and efficiently.
+
+npx skills add supabase/agent-skills
+
+LLM exmaple:
+import json
+from openai import OpenAI
+client = OpenAI(api_key='5d268ceea9cf435196a59f0e516f8c87.NT44gcWud2AlZX5q', base_url='https://open.bigmodel.cn/api/paas/v4')
+
+def get_weather(location: str) -> str:
+    """获取指定地点的天气信息"""
+    # 这里应该调用真实的天气 API
+    return f"{location} 的天气：晴天，温度 25°C"
+
+# 定义函数描述
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "获取指定地点的天气信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "地点名称，例如：北京、上海"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+# 调用带函数的对话
+response = client.chat.completions.create(
+    model="glm-5",
+    messages=[
+        {"role": "user", "content": "北京今天天气怎么样？"}
+    ],
+    tools=tools,
+    tool_choice="auto"
+)
+
+# 处理函数调用
+message = response.choices[0].message
+if message.tool_calls:
+    for tool_call in message.tool_calls:
+        if tool_call.function.name == "get_weather":
+            args = json.loads(tool_call.function.arguments)
+            result = get_weather(args["location"])
+            print(f"函数调用结果: {result}")
+
+
+embedding:
+import requests
+import urllib3
+
+# 禁用安全警告（可选，让输出更干净）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+url = "https://frp-fun.com:61208/embed/v1/embeddings"
+
+# 注意：这里直接用字典，不要用 json.dumps
+payload = {
+   "model": "Qwen3-Embedding-0.6B",
+   "input": "Linux Nginx Test"
+}
+
+headers = {
+   'X-Gateway-Key': 'Bearer sk-test-client-001',
+   'Content-Type': 'application/json'
+}
+
+try:
+    # 修正点 1: 传入原生的 payload 字典
+    response = requests.post(url, json=payload, headers=headers, verify=False)
+    
+    # 修正点 2: 打印状态码，方便调试（如果是 404 或 500，.json() 肯定会报错）
+    print(f"Status Code: {response.status_code}")
+    
+    # 修正点 3: 先检查响应内容是否为空
+    if response.text:
+        print(response.json())
+    else:
+        print("服务器返回了空内容")
+        
+except requests.exceptions.JSONDecodeError:
+    print("返回内容不是 JSON 格式:")
+    print(response.text) # 打印出实际返回的内容（可能是报错网页）
+
+
+rerank:
+import requests
+
+url = "https://frp-fun.com:61208/rerank/v1/rerank"
+payload = {
+   "model": "Qwen3-Reranker-0.6B",
+   "query": "什么是人工智能？",
+   "documents": ["人工智能是计算机科学的一个分支", "今天天气真不错", "机器学习是AI的核心"]
+}
+headers = {
+   'X-Gateway-Key': 'Bearer sk-test-client-001',
+   'Content-Type': 'application/json'
+}
+
+# verify=False 即可跳过 SSL 验证
+response = requests.post(url, json=payload, headers=headers, verify=False)
+
+print(response.json())
+
+
+LLM:
+import httpx
+from openai import OpenAI
+
+# 创建自定义 httpx 客户端，处理自签名证书
+http_client = httpx.Client(
+    verify=False,  # ⚠️ 跳过 SSL 验证（仅开发/测试用）
+    # verify="/path/to/cert.pem",  # ✅ 生产环境：指定证书文件
+    timeout=60.0,  # 可选：调整超时时间
+)
+
+# 初始化 OpenAI 客户端
+client = OpenAI(
+    api_key="sk-test-client-001",  # API Key（会被覆盖，但必须传）
+    base_url="https://frp-fun.com:61208/llm2/v1",  # ✅ 注意：只到 /v1
+    http_client=http_client,
+    default_headers={
+        "X-Gateway-Key": "Bearer sk-test-client-001",  # ✅ 自定义认证头
+    },
+)
+
+response = client.chat.completions.create(
+    model="Qwen3-30B-A3B-Instruct-2507",
+    messages=[{"role": "user", "content": "你好"}],
+    temperature=0.7,
+)
+
+print(response.choices[0].message.content)
+
+stream = client.chat.completions.create(
+    model="Qwen3-30B-A3B-Instruct-2507",
+    messages=[{"role": "user", "content": "你好"}],
+    temperature=0.7,
+    stream=True,  # ✅ 启用流式
+)
+
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()  # 换行
+
+
+es:
+集群权限: 仅限 monitor（可查看健康状态，不可修改集群设置）。
+
+索引权限: 仅限以 test_ 开头的索引（例如 test_data, test_logs）。
+
+操作权限: 拥有对上述索引的 all 权限（增删改查、删除索引）。
+
+code example:
+import requests
+
+url = "https://frp-fun.com:61208/es/_cluster/health?pretty"
+headers = {
+   'X-Gateway-Key': 'Bearer sk-admin-super-key'
+}
+
+# auth 参数会自动帮你转换成 Basic Auth 的 header
+response = requests.get(
+    url, 
+    auth=('test_user', 'test_user'), 
+    headers=headers, 
+    verify=False
+)
+
+print("状态码:", response.status_code)
+print("返回内容:", response.text)
+
